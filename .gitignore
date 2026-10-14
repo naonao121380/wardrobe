@@ -23,6 +23,7 @@ dist/
 data/
 media/
 out/
+*-media/
 *.db
 *.sqlite
 *.sqlite3

@@ -22,8 +22,7 @@ from app.core.security import (
 )
 from app.core.time import now_utc
 from app.models.user import User, UserSession
-from app.schemas.auth import (
-    LoginRequest,
+from app.schemas.auth import (    LoginRequest,
     PasswordChangeRequest,
     RefreshRequest,
     RegisterRequest,
@@ -31,6 +30,7 @@ from app.schemas.auth import (
     TokenResponse,
     UserOut,
 )
+from app.services.tags import seed_default_categories
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -139,6 +139,8 @@ async def register(payload: RegisterRequest, request: Request, db: DbSession) ->
         password_hash=hash_password(payload.password),
     )
     db.add(user)
+    await db.flush()
+    await seed_default_categories(db, user.id)
     await db.commit()
     await db.refresh(user)
     return await _issue_tokens(db, user, request, payload.device_label)

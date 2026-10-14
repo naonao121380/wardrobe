@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.core.security import hash_password
 from app.db import SessionLocal
 from app.models.user import User
+from app.services.tags import seed_default_categories
 
 
 async def _create_user(username: str, password: str, admin: bool, display_name: str | None) -> int:
@@ -35,6 +36,11 @@ async def _create_user(username: str, password: str, admin: bool, display_name: 
                 is_admin=admin,
             )
         )
+        await db.flush()
+        new_id = (
+            await db.execute(select(User.id).where(User.username == username))
+        ).scalar_one()
+        await seed_default_categories(db, new_id)
         await db.commit()
     print(f"已创建用户：{username}{'（管理员）' if admin else ''}")
     return 0

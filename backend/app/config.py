@@ -33,8 +33,14 @@ class Settings(BaseSettings):
     bootstrap_username: str | None = None
     bootstrap_password: str | None = None
 
-    # 媒体文件根目录（批次 2/3 使用）
+    # 媒体文件根目录
     media_root: str = "/data/media"
+    # 媒体签名 URL 有效期（秒）。图片走 <img> 标签，无法带 Authorization 头，
+    # 因此改用签名 URL —— 见 app/core/media.py。
+    media_url_ttl_seconds: int = 7 * 24 * 3600
+    max_upload_bytes: int = 20 * 1024 * 1024
+    thumbnail_small_px: int = 240
+    thumbnail_medium_px: int = 720
 
     # 逗号分隔，避免复杂类型的 JSON 解析问题
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

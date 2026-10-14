@@ -91,7 +91,9 @@ function extractDetail(body: unknown, fallback: string): string {
 
 async function raw<T>(path: string, init: RequestInit, withAuth: boolean): Promise<T> {
   const headers = new Headers(init.headers);
-  if (init.body !== undefined && !headers.has("Content-Type")) {
+  // FormData 必须让浏览器自己带 boundary，手写 Content-Type 会把上传打坏。
+  const isForm = typeof FormData !== "undefined" && init.body instanceof FormData;
+  if (init.body !== undefined && !isForm && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   if (withAuth && accessToken) {
@@ -112,12 +114,21 @@ async function raw<T>(path: string, init: RequestInit, withAuth: boolean): Promi
   return (await res.json()) as T;
 }
 
-async function request<T>(path: string, init: RequestInit = {}, allowRetry = true): Promise<T> {
+/**
+ * 通用请求入口（供其它 api 模块复用）。
+ *
+ * 带 401 自动刷新重试；`allowRetry` 为 false 时不再递归。
+ */
+export function request<T>(path: string, init: RequestInit = {}, allowRetry = true): Promise<T> {
+  return doRequest<T>(path, init, allowRetry);
+}
+
+async function doRequest<T>(path: string, init: RequestInit, allowRetry: boolean): Promise<T> {
   try {
     return await raw<T>(path, init, true);
   } catch (err) {
     if (err instanceof ApiError && err.status === 401 && allowRetry) {
-      if (await tryRefresh()) return request<T>(path, init, false);
+      if (await tryRefresh()) return doRequest<T>(path, init, false);
       authLostHandler?.();
     }
     throw err;

@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.core.security import hash_password
 from app.db import SessionLocal
 from app.models.user import User
+from app.services.tags import seed_default_categories
 
 log = logging.getLogger(__name__)
 
@@ -34,5 +35,10 @@ async def ensure_bootstrap_admin() -> None:
                 is_active=True,
             )
         )
+        await db.flush()
+        user_id = (
+            await db.execute(select(User.id).where(User.username == s.bootstrap_username))
+        ).scalar_one()
+        await seed_default_categories(db, user_id)
         await db.commit()
         log.info("已创建引导管理员账号：%s", s.bootstrap_username)

@@ -4,19 +4,27 @@
 所有跨库 datetime 比较都经 ``app.core.time.as_aware`` 归一化，见 models/base.py 的说明。
 """
 
+import os
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 
-import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+# ⚠️ 必须在导入 app.* 之前设置：app.db 在 import 时就会读取配置。
+_MEDIA_TMP = Path(tempfile.mkdtemp(prefix="wardrobe-test-media-"))
+os.environ.setdefault("WARDROBE_MEDIA_ROOT", str(_MEDIA_TMP))
 
-from app.config import get_settings
-from app.core.security import hash_password
-from app.db import Base, get_session
-from app.main import app
-from app.models.user import User
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+from app.config import get_settings  # noqa: E402
+from app.core.security import hash_password  # noqa: E402
+from app.db import Base, attach_sqlite_fk_pragma, get_session  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models.user import User  # noqa: E402
+from app.services.tags import seed_default_categories  # noqa: E402
 
 TEST_PASSWORD = "secret12345"
 
@@ -28,6 +36,7 @@ async def engine():
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
+    attach_sqlite_fk_pragma(eng)
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield eng
@@ -61,6 +70,9 @@ async def user(session_factory) -> User:
             display_name="闹闹",
         )
         s.add(u)
+        await s.flush()
+        # 生产环境在用户创建时播种默认标签类别，测试保持一致
+        await seed_default_categories(s, u.id)
         await s.commit()
         await s.refresh(u)
         return u
@@ -73,9 +85,28 @@ async def auth_headers(client: AsyncClient, user: User) -> dict[str, str]:
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
 
+@pytest_asyncio.fixture
+async def second_headers(client: AsyncClient, session_factory) -> dict[str, str]:
+    """第二个用户，用于验证跨用户隔离。"""
+    async with session_factory() as s:
+        u = User(username="lily", password_hash=hash_password(TEST_PASSWORD), display_name="Lily")
+        s.add(u)
+        await s.flush()
+        await seed_default_categories(s, u.id)
+        await s.commit()
+    r = await client.post("/api/auth/login", json={"username": "lily", "password": TEST_PASSWORD})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
 @pytest.fixture
 def allow_registration(monkeypatch):
     monkeypatch.setenv("WARDROBE_ALLOW_REGISTRATION", "true")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def media_root() -> Path:
+    return _MEDIA_TMP
