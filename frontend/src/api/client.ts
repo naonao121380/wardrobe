@@ -124,21 +124,55 @@ async function request<T>(path: string, init: RequestInit = {}, allowRetry = tru
   }
 }
 
-export async function tryRefresh(): Promise<boolean> {
-  const rt = getRefreshToken();
-  if (!rt) return false;
+let refreshInFlight: Promise<boolean> | null = null;
+
+async function performRefresh(): Promise<boolean> {
+  const used = getRefreshToken();
+  if (!used) return false;
+
   try {
     const data = await raw<TokenResponse>(
       "/auth/refresh",
-      { method: "POST", body: JSON.stringify({ refresh_token: rt }) },
+      { method: "POST", body: JSON.stringify({ refresh_token: used }) },
       false,
     );
     setTokens(data);
     return true;
   } catch {
+    // 多标签页竞争：另一个标签页可能刚好换过令牌，localStorage 里已是新的。
+    // 用新令牌再试一次，避免无谓地把用户踢下线。
+    const latest = getRefreshToken();
+    if (latest && latest !== used) {
+      try {
+        const data = await raw<TokenResponse>(
+          "/auth/refresh",
+          { method: "POST", body: JSON.stringify({ refresh_token: latest }) },
+          false,
+        );
+        setTokens(data);
+        return true;
+      } catch {
+        /* 落到下面统一清理 */
+      }
+    }
     clearTokens();
     return false;
   }
+}
+
+/**
+ * 刷新访问令牌。
+ *
+ * 同一时刻只会真正发出一个请求 —— React StrictMode 在开发模式下会把 effect 跑两遍，
+ * 若不去重，两个并发刷新会各自建一个会话（服务端轮换是原子的，落败方会拿到 401）。
+ */
+export function tryRefresh(): Promise<boolean> {
+  if (!refreshInFlight) {
+    refreshInFlight = performRefresh().finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
 }
 
 export const api = {

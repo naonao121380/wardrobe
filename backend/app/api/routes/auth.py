@@ -20,7 +20,7 @@ from app.core.security import (
     new_refresh_token,
     verify_password,
 )
-from app.core.time import as_aware, now_utc
+from app.core.time import now_utc
 from app.models.user import User, UserSession
 from app.schemas.auth import (
     LoginRequest,
@@ -147,25 +147,33 @@ async def register(payload: RegisterRequest, request: Request, db: DbSession) ->
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(payload: RefreshRequest, request: Request, db: DbSession) -> TokenResponse:
     digest = hash_refresh_token(payload.refresh_token)
-    us = (
-        await db.execute(
-            select(UserSession).where(UserSession.refresh_token_hash == digest)
-        )
-    ).scalar_one_or_none()
-    if us is None or us.revoked_at is not None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "刷新令牌无效")
-    if as_aware(us.expires_at) <= now_utc():
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "刷新令牌已过期")
+    now = now_utc()
 
-    user = await db.get(User, us.user_id)
+    # 原子 compare-and-swap：只有第一个请求能把 revoked_at 从 NULL 改掉。
+    # 并发刷新（多标签页 / React StrictMode 双跑 effect）时落败方拿不到行，直接 401。
+    # 若写成「先 SELECT 判断再 UPDATE」，两个并发请求会双双通过判断、各建一个会话。
+    row = (
+        await db.execute(
+            update(UserSession)
+            .where(
+                UserSession.refresh_token_hash == digest,
+                UserSession.revoked_at.is_(None),
+                UserSession.expires_at > now,
+            )
+            .values(revoked_at=now)
+            .returning(UserSession.user_id, UserSession.device_label)
+        )
+    ).first()
+    await db.commit()
+
+    if row is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "刷新令牌无效或已过期")
+
+    user = await db.get(User, row.user_id)
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已停用")
 
-    # 轮换：旧会话立即作废，签发新会话（检测到重放时旧令牌已不可用）
-    label = us.device_label
-    us.revoked_at = now_utc()
-    await db.commit()
-    return await _issue_tokens(db, user, request, label)
+    return await _issue_tokens(db, user, request, row.device_label)
 
 
 @router.post("/logout")

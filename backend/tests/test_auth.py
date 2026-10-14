@@ -190,6 +190,32 @@ async def test_register_rejects_duplicate(client: AsyncClient, user, allow_regis
     assert r.status_code == 409
 
 
+async def test_refresh_is_atomic_under_concurrency(client: AsyncClient, user) -> None:
+    """并发刷新同一个令牌，只能有一个成功。
+
+    回归用例：此前写成「先 SELECT 判断 revoked_at，再 UPDATE」时，两个并发请求会
+    双双通过判断、各自建出一个会话。浏览器端 React StrictMode 双跑 effect 时真实触发过
+    （设置页曾出现两个时间戳完全相同的活跃会话）。
+    """
+    import asyncio
+
+    login = await client.post(
+        "/api/auth/login", json={"username": "naonao", "password": TEST_PASSWORD}
+    )
+    rt = login.json()["refresh_token"]
+
+    a, b = await asyncio.gather(
+        client.post("/api/auth/refresh", json={"refresh_token": rt}),
+        client.post("/api/auth/refresh", json={"refresh_token": rt}),
+    )
+    assert sorted([a.status_code, b.status_code]) == [200, 401]
+
+    winner = a if a.status_code == 200 else b
+    headers = {"Authorization": f"Bearer {winner.json()['access_token']}"}
+    sessions = (await client.get("/api/auth/sessions", headers=headers)).json()
+    assert len(sessions) == 1, f"并发刷新后应只剩 1 个活跃会话，实际 {len(sessions)}"
+
+
 async def test_change_password_revokes_all_sessions(client: AsyncClient, user) -> None:
     login = await client.post(
         "/api/auth/login", json={"username": "naonao", "password": TEST_PASSWORD}
