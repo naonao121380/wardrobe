@@ -1,0 +1,77 @@
+name: wardrobe
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wardrobe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 中设置}
+      POSTGRES_DB: ${POSTGRES_DB:-wardrobe}
+      TZ: Asia/Shanghai
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wardrobe} -d ${POSTGRES_DB:-wardrobe}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [wardrobe]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [wardrobe]
+
+  api:
+    build:
+      context: ./backend
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: wardrobe-api:${WARDROBE_TAG:-dev}
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      WARDROBE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wardrobe}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-wardrobe}
+      WARDROBE_REDIS_URL: redis://redis:6379/0
+      TZ: Asia/Shanghai
+    volumes:
+      - media-data:/data/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: [wardrobe]
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    image: wardrobe-web:${WARDROBE_TAG:-dev}
+    restart: unless-stopped
+    ports:
+      - "${WARDROBE_PORT:-43470}:80"
+    depends_on:
+      api:
+        condition: service_started
+    networks: [wardrobe]
+
+volumes:
+  db-data:
+  redis-data:
+  media-data:
+
+networks:
+  wardrobe:
+    driver: bridge

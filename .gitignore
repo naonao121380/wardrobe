@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Node ----
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# ---- 环境与密钥 ----
+.env
+.env.local
+.env.*.local
+
+# ---- 运行期数据 ----
+data/
+media/
+out/
+*.db
+*.sqlite
+*.sqlite3
+dev.db*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
