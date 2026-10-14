@@ -22,8 +22,25 @@ async def _create(client: AsyncClient, headers, name: str = "米白针织开衫"
 
 
 async def _add_tag_value(client: AsyncClient, headers, category: str, value: str) -> int:
+    """取该类别下的取值 id；类别或取值不存在就建。
+
+    默认只播种「大类」，所以像「材质」这种类别测试里要自己建。已存在（409）
+    时复用 —— 预置的「外套」这类取值会撞名。
+    """
     cats = (await client.get("/api/tags/categories", headers=headers)).json()
-    target = next(c for c in cats if c["name"] == category)
+    target = next((c for c in cats if c["name"] == category), None)
+    if target is None:
+        r = await client.post(
+            "/api/tags/categories",
+            json={"scope": "garment", "name": category},
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        target = r.json()
+
+    for v in target["values"]:
+        if v["value"] == value:
+            return v["id"]
     r = await client.post(
         f"/api/tags/categories/{target['id']}/values", json={"value": value}, headers=headers
     )

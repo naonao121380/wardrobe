@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import io
+import logging
 import uuid
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from PIL import Image, ImageOps
 
 from app.config import get_settings
 from app.core.time import now_utc
+
+log = logging.getLogger(__name__)
 
 # 单张图片解码上限，防解压炸弹
 Image.MAX_IMAGE_PIXELS = 80_000_000
@@ -124,14 +127,19 @@ def store_image(owner_id: int, data: bytes, content_type: str | None) -> dict[st
 
 
 def delete_keys(keys: list[str | None]) -> None:
-    """尽力删除；文件已不存在或路径非法都不报错。"""
+    """尽力删除磁盘文件；**任何**失败都只记日志，绝不往上抛。
+
+    调用方（删衣物 / 删图片）已经提交了数据库事务，文件删不掉只是留下垃圾，
+    不该让整个请求变成 500 —— 用户看到的是「删不掉」，而实际数据已经删了，
+    这比留个孤儿文件糟糕得多。孤儿文件由 `cli check-media` 兜底清理。
+    """
     for key in keys:
         if not key:
             continue
         try:
             resolve_key(key).unlink(missing_ok=True)
-        except (MediaError, OSError):
-            continue
+        except Exception as exc:  # noqa: BLE001 - 见上：这里就是要吞掉一切
+            log.warning("删除媒体文件失败，已跳过：%s（%s）", key, exc)
 
 
 def open_for_export(rel_key: str) -> tuple[bytes, str]:

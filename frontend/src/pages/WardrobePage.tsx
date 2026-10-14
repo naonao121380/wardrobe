@@ -4,6 +4,7 @@ import { ApiError } from "../api/client";
 import { wardrobeApi, type Garment, type TagCategory } from "../api/wardrobe";
 import GarmentEditor from "../components/GarmentEditor";
 import TagManager from "../components/TagManager";
+import Thumb from "../components/Thumb";
 
 const PAGE_SIZE = 48;
 
@@ -188,7 +189,7 @@ export default function WardrobePage() {
             <article className="gcard" key={g.id}>
               <button type="button" className="gcard-thumb" onClick={() => setEditing(g)}>
                 {g.cover_url ? (
-                  <img src={g.cover_url} alt={g.name} loading="lazy" />
+                  <Thumb src={g.cover_url} alt={g.name} fallback="图片丢失" />
                 ) : (
                   <span className="gcard-noimg">无图</span>
                 )}

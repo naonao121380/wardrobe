@@ -5,6 +5,7 @@
     python -m app.cli create-user --username naonao --password 'xxx' --admin
     python -m app.cli list-users
     python -m app.cli reset-password --username naonao --password 'yyy'
+    python -m app.cli reseed-tags --username naonao --yes
 """
 
 import argparse
@@ -17,7 +18,7 @@ from sqlalchemy import select
 from app.core.security import hash_password
 from app.db import SessionLocal
 from app.models.user import User
-from app.services.tags import seed_default_categories
+from app.services.tags import DEFAULT_CATEGORIES, DEFAULT_VALUES, reset_tags, seed_default_categories
 
 
 async def _create_user(username: str, password: str, admin: bool, display_name: str | None) -> int:
@@ -73,6 +74,34 @@ async def _list_users() -> int:
     return 0
 
 
+async def _reseed_tags(username: str) -> int:
+    """清空该用户的标签体系，按当前默认值重建（衣物不动，只解除标签关联）。"""
+    async with SessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == username))
+        ).scalar_one_or_none()
+        if user is None:
+            print(f"用户不存在：{username}", file=sys.stderr)
+            return 1
+
+        stats = await reset_tags(db, user.id)
+        await db.commit()
+
+    print(f"已重置 {username} 的标签体系：")
+    print(
+        f"  删除 类别 {stats['removed_categories']} / 取值 {stats['removed_values']}，"
+        f"解除衣物标签关联 {stats['untagged']} 条"
+    )
+    print(f"  重建 类别 {stats['created_categories']} / 取值 {stats['created_values']}")
+    for scope, names in DEFAULT_CATEGORIES.items():
+        presets = DEFAULT_VALUES.get(scope, {})
+        detail = "、".join(
+            f"{n}（{len(presets[n])} 个取值）" if presets.get(n) else f"{n}（空）" for n in names
+        )
+        print(f"  [{scope}] {detail}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="wardrobe", description="衣橱管理系统运维 CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -89,10 +118,22 @@ def main() -> int:
 
     sub.add_parser("list-users", help="列出用户")
 
+    p_reseed = sub.add_parser("reseed-tags", help="清空并重建某用户的标签体系")
+    p_reseed.add_argument("--username", required=True)
+    p_reseed.add_argument("--yes", action="store_true", help="跳过确认")
+
     args = parser.parse_args()
 
     if args.cmd == "list-users":
         return asyncio.run(_list_users())
+
+    if args.cmd == "reseed-tags":
+        if not args.yes:
+            print("这会删掉该用户的全部标签类别/取值，并解除所有衣物的标签关联。")
+            if input("确认？输入 yes 继续: ").strip().lower() != "yes":
+                print("已取消")
+                return 1
+        return asyncio.run(_reseed_tags(args.username))
 
     password = args.password or getpass.getpass("密码: ")
     if args.cmd == "create-user":

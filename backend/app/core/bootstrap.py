@@ -39,6 +39,6 @@ async def ensure_bootstrap_admin() -> None:
         user_id = (
             await db.execute(select(User.id).where(User.username == s.bootstrap_username))
         ).scalar_one()
-        await seed_default_categories(db, user_id)
+        cats, values = await seed_default_categories(db, user_id)
         await db.commit()
-        log.info("已创建引导管理员账号：%s", s.bootstrap_username)
+        log.info("已创建引导管理员账号：%s（默认标签 %d 类别 / %d 取值）", s.bootstrap_username, cats, values)

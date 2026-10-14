@@ -89,9 +89,10 @@ def ensure_value(token: str, cat_id: int, value: str) -> int:
     """新增取值；已存在（409）则从类别列表里找回它的 id —— 让脚本可重复跑。"""
     code, body = call("POST", f"/tags/categories/{cat_id}/values", token=token, json_body={"value": value})
     if code == 201:
-        check(f"新增取值「{value}」201", True)
+        check(f"取值「{value}」新建成功", True)
         return body["id"]  # type: ignore[index]
-    check(f"新增取值「{value}」201", code == 409, f"got {code} {body}")
+    # 409 说明是预置值或上次跑残留 —— 都算正常，去列表里捞回来
+    check(f"取值「{value}」已存在（复用）", code == 409, f"got {code} {body}")
     _, cats = call("GET", "/tags/categories?scope=garment", token=token)
     for c in cats:  # type: ignore[union-attr]
         if c["id"] == cat_id:
@@ -99,6 +100,20 @@ def ensure_value(token: str, cat_id: int, value: str) -> int:
                 if v["value"] == value:
                     return v["id"]
     raise RuntimeError(f"取值 {value} 既建不了也找不到")
+
+
+def ensure_category(token: str, name: str, scope: str = "garment") -> int:
+    """取类别 id；不存在就建 —— 默认只播种「大类」，细类要用户自己加。"""
+    _, cats = call("GET", f"/tags/categories?scope={scope}", token=token)
+    for c in cats:  # type: ignore[union-attr]
+        if c["name"] == name:
+            return c["id"]
+    code, body = call(
+        "POST", "/tags/categories", token=token, json_body={"scope": scope, "name": name}
+    )
+    if code != 201:
+        raise RuntimeError(f"建类别 {name} 失败：{code} {body}")
+    return body["id"]  # type: ignore[index]
 
 
 def ensure_user(username: str, password: str) -> str:
@@ -118,22 +133,30 @@ def main() -> int:
         return 1
     token = body["access_token"]  # type: ignore[index]
 
-    # 清掉上一次跑残留的衣物，保证「按名称命中」这类断言是确定的
+    # 只清掉本脚本造过的同名衣物（避免误删 seed_demo 的演示数据），
+    # 保证「按名称命中」这类断言是确定的
+    mine = {"米白羊毛外套"}
     _, existing = call("GET", "/garments?page_size=200", token=token)
     for it in existing["items"]:  # type: ignore[index]
-        call("DELETE", f"/garments/{it['id']}", token=token)
+        if it["name"] in mine:
+            call("DELETE", f"/garments/{it['id']}", token=token)
 
     print("\n== 2. 默认标签体系 ==")
     code, cats = call("GET", "/tags/categories?scope=garment", token=token)
     check("取衣物标签 200", code == 200)
     names = [c["name"] for c in cats]  # type: ignore[union-attr]
-    check("默认四类齐全", names == ["大类", "小类", "颜色", "材质"], f"got {names}")
+    # 精确的「初始化只给大类」由 pytest 在干净库里断言；这里 admin 可能已被
+    # 本脚本加过「材质」，所以只校验大类排在第一位且预置值齐全。
+    check("「大类」是第一个类别", names and names[0] == "大类", f"got {names}")
+    check("小类 / 颜色 未被初始化", "小类" not in names and "颜色" not in names, f"got {names}")
+    preset = [v["value"] for v in cats[0]["values"]]  # type: ignore[index]
+    check("大类预置 8 个取值", len(preset) == 8, f"got {preset}")
 
     code, outfit_cats = call("GET", "/tags/categories?scope=outfit", token=token)
-    check("搭配标签独立（季节/风格/色系）", [c["name"] for c in outfit_cats] == ["季节", "风格", "色系"])  # type: ignore[union-attr]
+    check("搭配侧初始化只给「季节」", [c["name"] for c in outfit_cats] == ["季节"])  # type: ignore[union-attr]
 
-    cat_id = next(c["id"] for c in cats if c["name"] == "大类")  # type: ignore[union-attr]
-    mat_id = next(c["id"] for c in cats if c["name"] == "材质")  # type: ignore[union-attr]
+    cat_id = cats[0]["id"]  # type: ignore[index]
+    mat_id = ensure_category(token, "材质")  # 细类要用户自己加
     v1_id = ensure_value(token, cat_id, "外套")
     v2_id = ensure_value(token, mat_id, "羊毛")
     code, _ = call("POST", f"/tags/categories/{cat_id}/values", token=token, json_body={"value": "外套"})
@@ -185,12 +208,21 @@ def main() -> int:
     check("第二张成为首图", g3["images"][0]["id"] == imgs[1]["id"], f"got {[i['id'] for i in g3['images']]}")  # type: ignore[index]
 
     print("\n== 7. 筛选 ==")
+    # 库里可能有 seed_demo 的演示数据，所以断言「包含」而不是「恰好等于」
     code, lst = call("GET", f"/garments?tag_value_ids={v1_id}", token=token)
-    check("按标签命中", lst["total"] == 1, f"got {lst['total']}")  # type: ignore[index]
-    code, lst = call("GET", "/garments?q=羊毛", token=token)
-    check("按名称命中", lst["total"] == 1, f"got {lst['total']}")  # type: ignore[index]
+    ids = [i["id"] for i in lst["items"]]  # type: ignore[index]
+    check("按标签命中包含本件", gid in ids, f"got {ids}")
+
+    code, lst = call("GET", "/garments?q=米白羊毛外套", token=token)
+    names = [i["name"] for i in lst["items"]]  # type: ignore[index]
+    check("按名称命中本件", names == ["米白羊毛外套"], f"got {names}")
+
     code, lst = call("GET", "/garments?q=不存在的名字", token=token)
     check("无匹配为空", lst["total"] == 0, f"got {lst['total']}")  # type: ignore[index]
+
+    code, lst = call("GET", f"/garments?tag_value_ids={v1_id}&tag_value_ids={v2_id}", token=token)
+    ids = [i["id"] for i in lst["items"]]  # type: ignore[index]
+    check("双标签取交集包含本件", gid in ids, f"got {ids}")
 
     print("\n== 8. 用户隔离 ==")
     lt = ensure_user("e2e_lily", "lily12345")
@@ -199,7 +231,13 @@ def main() -> int:
     code, _ = call("GET", f"/garments/{gid}", token=lt)
     check("他人直取详情 404", code == 404, f"got {code}")
     code, lc = call("GET", "/tags/categories?scope=garment", token=lt)
-    check("他人有自己的一套默认标签", [c["name"] for c in lc] == ["大类", "小类", "颜色", "材质"])  # type: ignore[union-attr]
+    lnames = [c["name"] for c in lc]  # type: ignore[union-attr]
+    # lily 可能是上一次跑残留的（那会儿默认还是四类），所以只断言「有自己的一套大类」
+    check("他人有自己的「大类」", "大类" in lnames, f"got {lnames}")
+    check(
+        "他人的大类不是我的那个",
+        next(c["id"] for c in lc if c["name"] == "大类") != cat_id,  # type: ignore[union-attr]
+    )
 
     print("\n== 9. 删除衣物连带清图 ==")
     code, res = call("DELETE", f"/garments/{gid}", token=token)

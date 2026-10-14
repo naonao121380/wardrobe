@@ -8,6 +8,7 @@ import {
   type TagCategory,
 } from "../api/wardrobe";
 import Dialog from "./Dialog";
+import Thumb from "./Thumb";
 
 type Props = {
   /** null = 新建 */
@@ -217,7 +218,7 @@ export default function GarmentEditor({ garment, categories, onClose, onSaved, o
           <div className="imgrid">
             {images.map((img, idx) => (
               <figure className="imgcell" key={img.id}>
-                <img src={img.thumb_small_url} alt="" loading="lazy" />
+                <Thumb src={img.thumb_small_url} fallback="图片丢失" />
                 {idx === 0 && <span className="imgcell-badge">封面</span>}
                 <figcaption>
                   <button
