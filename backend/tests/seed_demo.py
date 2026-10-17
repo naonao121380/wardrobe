@@ -1,9 +1,11 @@
 """造一批演示数据，供浏览器验收时看缩略图墙用。
 
-只打「大类」标签 —— 与新用户的默认体系保持一致。颜色 / 材质 / 小类留给用户自己
-在「管理标签」里加，脚本不越俎代庖。
+⚠️ **这是演示数据，不是「初始化默认值」。** 新用户的默认骨架只预置「大类」的 8 个
+取值和一套颜色词表（见 ``app/services/tags.py``）；「小类」默认是空的。本脚本为了
+让级联筛选在浏览器里看得见，会额外建若干「小类」取值并挂到对应「大类」下 ——
+这只发生在这台开发机上，不会影响任何真实用户的初始化结果。
 
-幂等：只删本脚本造过的同名衣物，不动用户自己传的东西。
+幂等：只删本脚本造过的同名衣物，不动用户自己传的东西；小类取值撞名就复用。
 """
 
 from __future__ import annotations
@@ -19,20 +21,21 @@ from PIL import Image, ImageDraw
 
 BASE = "http://127.0.0.1:8000/api"
 
-#: (名称, 大类, 形状, 主色)
-DEMO: list[tuple[str, str, str, tuple[int, int, int]]] = [
-    ("米白羊毛开衫", "上装", "top", (238, 232, 220)),
-    ("酒红真丝衬衫", "上装", "top", (132, 44, 58)),
-    ("浅灰连帽卫衣", "上装", "top", (176, 176, 178)),
-    ("藏青直筒牛仔裤", "下装", "bottom", (52, 66, 96)),
-    ("卡其工装裤", "下装", "bottom", (168, 148, 108)),
-    ("黑色针织连衣裙", "连衣裙", "dress", (44, 42, 46)),
-    ("黑色西装外套", "外套", "top", (48, 46, 48)),
-    ("驼色长款风衣", "外套", "top", (196, 164, 122)),
-    ("白色帆布鞋", "鞋履", "shoe", (242, 242, 238)),
-    ("棕色皮质托特包", "包袋", "bag", (108, 74, 46)),
-    ("棕色皮带", "配饰", "belt", (96, 66, 42)),
-    ("灰色纯棉家居套装", "内衣家居", "top", (198, 200, 202)),
+#: (名称, 大类, 小类, 颜色, 形状, 主色)
+#: 大类 / 小类都取自默认分类树（app/services/tags.py），脚本只复用不新建。
+DEMO: list[tuple[str, str, str, str, str, tuple[int, int, int]]] = [
+    ("米白针织开衫", "上衣", "针织衫", "米白", "top", (238, 232, 220)),
+    ("酒红真丝衬衫", "上衣", "衬衫", "红", "top", (132, 44, 58)),
+    ("浅灰连帽卫衣", "上衣", "卫衣", "灰", "top", (176, 176, 178)),
+    ("藏青直筒牛仔裤", "裤子", "牛仔裤", "藏青", "bottom", (52, 66, 96)),
+    ("卡其工装裤", "裤子", "工装裤", "卡其", "bottom", (168, 148, 108)),
+    ("黑色针织连衣裙", "连衣裙", "针织裙", "黑", "dress", (44, 42, 46)),
+    ("黑色西装", "上衣", "西装", "黑", "top", (48, 46, 48)),
+    ("驼色长款风衣", "上衣", "风衣", "驼", "top", (196, 164, 122)),
+    ("白色帆布鞋", "鞋子", "帆布鞋", "白", "shoe", (242, 242, 238)),
+    ("棕色皮质托特包", "包包", "托特包", "棕", "bag", (108, 74, 46)),
+    ("棕色腰带", "配饰", "腰带", "棕", "belt", (96, 66, 42)),
+    ("米白百褶半身裙", "半身裙", "百褶裙", "米白", "bottom", (238, 232, 220)),
 ]
 
 PAPER = (250, 249, 246)
@@ -155,22 +158,65 @@ def main() -> int:
     major = by_name["大类"]
     value_ids = {v["value"]: v["id"] for v in major["values"]}
 
-    def major_id(label: str) -> int:
-        if label in value_ids:
-            return value_ids[label]
+    def ensure_value(category: dict, label: str, parent_value_id: int | None = None) -> int:
+        """取类别下的取值 id；没有就建（可指定父值）。"""
+        for v in category["values"]:
+            if v["value"] == label:
+                return v["id"]
+        payload: dict = {"value": label}
+        if parent_value_id is not None:
+            payload["parent_value_id"] = parent_value_id
         code, v = call(
-            "POST", f"/tags/categories/{major['id']}/values", token=token, json_body={"value": label}
+            "POST", f"/tags/categories/{category['id']}/values", token=token, json_body=payload
         )
         if code != 201:
-            raise RuntimeError(f"建大类取值 {label} 失败：{code} {v}")
-        value_ids[label] = v["id"]
+            raise RuntimeError(f"建取值 {label} 失败：{code} {v}")
+        category["values"].append(v)
         return v["id"]
 
-    made = 0
-    for name, label, kind, color in DEMO:
-        code, g = call(
-            "POST", "/garments", token=token, json_body={"name": name, "tag_value_ids": [major_id(label)]}
+    def major_id(label: str) -> int:
+        return ensure_value(major, label)
+
+    # 「小类」是级联子类别：类别默认就建好了，这里只往里灌演示取值
+    minor = by_name.get("小类")
+    if minor is None:
+        code, minor = call(
+            "POST",
+            "/tags/categories",
+            token=token,
+            json_body={"scope": "garment", "name": "小类", "parent_category_id": major["id"]},
         )
+        if code != 201:
+            print(f"建「小类」类别失败：{code} {minor}")
+            return 1
+    elif minor["parent_category_id"] != major["id"]:
+        code, minor = call(
+            "PATCH",
+            f"/tags/categories/{minor['id']}",
+            token=token,
+            json_body={"parent_category_id": major["id"]},
+        )
+        if code != 200:
+            print(f"把「小类」挂到「大类」下失败：{code} {minor}")
+            return 1
+
+    color = by_name.get("颜色")  # 老库可能还没这一轴；没有就跳过颜色标签
+    if color is None:
+        print("⚠️ 该用户没有「颜色」类别（老数据），本次不打颜色标签；")
+        print("   想让演示数据完整，先跑 python -m app.cli reseed-tags --username admin --yes")
+
+    made = 0
+    for name, major_label, minor_label, color_label, kind, rgb in DEMO:
+        tag_ids = [major_id(major_label)]
+        # 小类取值必须挂在对应的「大类」取值下 —— 这就是级联
+        tag_ids.append(ensure_value(minor, minor_label, parent_value_id=major_id(major_label)))
+        if color is not None:
+            try:
+                tag_ids.append(ensure_value(color, color_label))
+            except RuntimeError as exc:
+                print(f"  [WARN] {name}：{exc}")
+
+        code, g = call("POST", "/garments", token=token, json_body={"name": name, "tag_value_ids": tag_ids})
         if code != 201:
             print(f"  建衣物 {name} 失败：{code} {g}")
             continue
@@ -178,15 +224,16 @@ def main() -> int:
             "POST",
             f"/garments/{g['id']}/images",
             token=token,
-            form=("files", [(f"{g['id']}.png", garment_png(kind, color), "image/png")]),
+            form=("files", [(f"{g['id']}.png", garment_png(kind, rgb), "image/png")]),
         )
         if code != 201:
             print(f"  传图 {name} 失败：{code}")
             continue
         made += 1
-        print(f"  [OK] {name}（{label}）")
+        print(f"  [OK] {name}（{major_label} / {minor_label} / {color_label}）")
 
     print(f"\n造了 {made} 件衣物")
+    print(f"小类取值 {len(minor['values'])} 个，已按大类分组挂好")
     return 0
 
 

@@ -1,0 +1,19 @@
+# Worker 镜像依赖（DECISIONS D5：ONNX 只装在 Worker，不进 API 镜像）
+#
+# 用法：docker build -f Dockerfile.worker -t wardrobe-worker:dev .
+# 本机/裸机跑：pip install -r requirements-worker.txt
+-r requirements.txt
+
+# VLM 打标走 HTTP，需要一个 async 客户端
+httpx>=0.27
+
+# 抠图：rembg（U²-Net）+ CPU 版 ONNX Runtime。
+# ⚠️ 装的是 [cpu] extra —— 不要让它把 onnxruntime-gpu 拖进来。
+# 不锁小版本：2.0.60 只支持到 Py3.12，2.0.62+ 才吃 Py3.13（Docker 镜像是 3.12，本机是 3.13）
+rembg[cpu]>=2.0.60
+
+# CLIP 零样本兜底（DECISIONS D7）。torch 有 800MB+，**默认注释掉**：
+# 需要时解开注释再构建镜像，或者装完 rembg 后单独 pip install。
+# --extra-index-url https://download.pytorch.org/whl/cpu
+# torch>=2.4,<3.0
+# open_clip_torch>=2.30

@@ -85,9 +85,12 @@ def png(size: tuple[int, int] = (900, 1200)) -> bytes:
     return buf.getvalue()
 
 
-def ensure_value(token: str, cat_id: int, value: str) -> int:
+def ensure_value(token: str, cat_id: int, value: str, parent_value_id: int | None = None) -> int:
     """新增取值；已存在（409）则从类别列表里找回它的 id —— 让脚本可重复跑。"""
-    code, body = call("POST", f"/tags/categories/{cat_id}/values", token=token, json_body={"value": value})
+    payload: dict = {"value": value}
+    if parent_value_id is not None:
+        payload["parent_value_id"] = parent_value_id
+    code, body = call("POST", f"/tags/categories/{cat_id}/values", token=token, json_body=payload)
     if code == 201:
         check(f"取值「{value}」新建成功", True)
         return body["id"]  # type: ignore[index]
@@ -102,15 +105,18 @@ def ensure_value(token: str, cat_id: int, value: str) -> int:
     raise RuntimeError(f"取值 {value} 既建不了也找不到")
 
 
-def ensure_category(token: str, name: str, scope: str = "garment") -> int:
-    """取类别 id；不存在就建 —— 默认只播种「大类」，细类要用户自己加。"""
+def ensure_category(
+    token: str, name: str, scope: str = "garment", parent_category_id: int | None = None
+) -> int:
+    """取类别 id；不存在就建。默认骨架已建齐，通常直接命中。"""
     _, cats = call("GET", f"/tags/categories?scope={scope}", token=token)
     for c in cats:  # type: ignore[union-attr]
         if c["name"] == name:
             return c["id"]
-    code, body = call(
-        "POST", "/tags/categories", token=token, json_body={"scope": scope, "name": name}
-    )
+    payload: dict = {"scope": scope, "name": name}
+    if parent_category_id is not None:
+        payload["parent_category_id"] = parent_category_id
+    code, body = call("POST", "/tags/categories", token=token, json_body=payload)
     if code != 201:
         raise RuntimeError(f"建类别 {name} 失败：{code} {body}")
     return body["id"]  # type: ignore[index]
@@ -141,22 +147,77 @@ def main() -> int:
         if it["name"] in mine:
             call("DELETE", f"/garments/{it['id']}", token=token)
 
-    print("\n== 2. 默认标签体系 ==")
+    print("\n== 2. 默认标签骨架 ==")
     code, cats = call("GET", "/tags/categories?scope=garment", token=token)
     check("取衣物标签 200", code == 200)
     names = [c["name"] for c in cats]  # type: ignore[union-attr]
-    # 精确的「初始化只给大类」由 pytest 在干净库里断言；这里 admin 可能已被
-    # 本脚本加过「材质」，所以只校验大类排在第一位且预置值齐全。
-    check("「大类」是第一个类别", names and names[0] == "大类", f"got {names}")
-    check("小类 / 颜色 未被初始化", "小类" not in names and "颜色" not in names, f"got {names}")
-    preset = [v["value"] for v in cats[0]["values"]]  # type: ignore[index]
-    check("大类预置 8 个取值", len(preset) == 8, f"got {preset}")
+    check(
+        "衣物骨架 = 大类/小类/颜色/材质",
+        names == ["大类", "小类", "颜色", "材质"],
+        f"got {names}（老库请先跑 cli reseed-tags --username admin --yes）",
+    )
+    by_name = {c["name"]: c for c in cats}  # type: ignore[union-attr]
+    major = by_name["大类"]
+    check("大类预置 8 个取值", len(major["values"]) == 8, f"got {[v['value'] for v in major['values']]}")
+    check("颜色预置一套词表（20）", len(by_name["颜色"]["values"]) == 20)
+    check(
+        "小类预置 8×10（每个大类各 10 个）、材质不预置",
+        len(by_name["小类"]["values"]) == 80 and by_name["材质"]["values"] == [],
+        f"小类 {len(by_name['小类']['values'])} 条",
+    )
+    check("小类级联到「大类」", by_name["小类"]["parent_category_id"] == major["id"])
+    check("颜色是顶层类别（不级联）", by_name["颜色"]["parent_category_id"] is None)
 
     code, outfit_cats = call("GET", "/tags/categories?scope=outfit", token=token)
-    check("搭配侧初始化只给「季节」", [c["name"] for c in outfit_cats] == ["季节"])  # type: ignore[union-attr]
+    check("搭配骨架 = 季节/风格/色系", [c["name"] for c in outfit_cats] == ["季节", "风格", "色系"])  # type: ignore[union-attr]
+    season = next(c for c in outfit_cats if c["name"] == "季节")  # type: ignore[union-attr]
+    check("季节预置 4 个取值", len(season["values"]) == 4)
+    check(
+        "风格 / 色系 不预置取值",
+        all(next(c for c in outfit_cats if c["name"] == n)["values"] == [] for n in ("风格", "色系")),  # type: ignore[union-attr]
+    )
 
-    cat_id = cats[0]["id"]  # type: ignore[index]
-    mat_id = ensure_category(token, "材质")  # 细类要用户自己加
+    print("\n== 2.5 级联（大类 → 小类）==")
+    minor = by_name["小类"]
+    outer = next(v for v in major["values"] if v["value"] == "上衣")
+    minor_id = ensure_value(token, minor["id"], "级联测试小类", parent_value_id=outer["id"])
+    _, cats2 = call("GET", "/tags/categories?scope=garment", token=token)
+    coat = next(
+        v
+        for c in cats2  # type: ignore[union-attr]
+        if c["name"] == "小类"
+        for v in c["values"]
+        if v["id"] == minor_id
+    )
+    check("小类取值挂到大类取值下", coat["parent_value_id"] == outer["id"], f"got {coat}")
+
+    black = next(v for v in by_name["颜色"]["values"] if v["value"] == "黑")
+    code, body = call(
+        "POST",
+        f"/tags/categories/{minor['id']}/values",
+        token=token,
+        json_body={"value": "跨类别挂父值", "parent_value_id": black["id"]},
+    )
+    check("小类取值挂到「颜色」取值下被拒 400", code == 400, f"got {code} {body}")
+
+    code, body = call(
+        "POST",
+        f"/tags/categories/{by_name['颜色']['id']}/values",
+        token=token,
+        json_body={"value": "顶层挂父值", "parent_value_id": outer["id"]},
+    )
+    check("顶层类别取值挂父值被拒 400", code == 400, f"got {code} {body}")
+
+    code, body = call(
+        "POST",
+        "/tags/categories",
+        token=token,
+        json_body={"scope": "garment", "name": "三层测试", "parent_category_id": minor["id"]},
+    )
+    check("只允许两层（子类别不能再当父）400", code == 400, f"got {code} {body}")
+
+    cat_id = major["id"]
+    mat_id = by_name["材质"]["id"]
     v1_id = ensure_value(token, cat_id, "外套")
     v2_id = ensure_value(token, mat_id, "羊毛")
     code, _ = call("POST", f"/tags/categories/{cat_id}/values", token=token, json_body={"value": "外套"})
@@ -232,12 +293,16 @@ def main() -> int:
     check("他人直取详情 404", code == 404, f"got {code}")
     code, lc = call("GET", "/tags/categories?scope=garment", token=lt)
     lnames = [c["name"] for c in lc]  # type: ignore[union-attr]
-    # lily 可能是上一次跑残留的（那会儿默认还是四类），所以只断言「有自己的一套大类」
     check("他人有自己的「大类」", "大类" in lnames, f"got {lnames}")
     check(
         "他人的大类不是我的那个",
         next(c["id"] for c in lc if c["name"] == "大类") != cat_id,  # type: ignore[union-attr]
     )
+    # 拿我的小类取值去挂到他人的大类上 → 404（跨用户看不见）
+    code, _ = call(
+        "PATCH", f"/tags/values/{minor_id}", token=lt, json_body={"parent_value_id": outer["id"]}
+    )
+    check("改他人的标签取值 404", code == 404, f"got {code}")
 
     print("\n== 9. 删除衣物连带清图 ==")
     code, res = call("DELETE", f"/garments/{gid}", token=token)
@@ -248,6 +313,22 @@ def main() -> int:
         check("文件已从磁盘清掉", False, "竟然还能取到")
     except urllib.error.HTTPError as e:
         check("文件已从磁盘清掉（404）", e.code == 404, f"got {e.code}")
+
+    print("\n== 10. 删大类取值 → 小类降级为未归类 ==")
+    tmp_major = ensure_value(token, cat_id, "E2E临时大类")
+    tmp_minor = ensure_value(token, minor["id"], "E2E临时小类", parent_value_id=tmp_major)
+    code, res = call("DELETE", f"/tags/values/{tmp_major}", token=token)
+    check("删大类取值 200", code == 200, f"got {code} {res}")
+    _, cats3 = call("GET", "/tags/categories?scope=garment", token=token)
+    survivor = next(
+        v
+        for c in cats3  # type: ignore[union-attr]
+        if c["name"] == "小类"
+        for v in c["values"]
+        if v["id"] == tmp_minor
+    )
+    check("小类取值还在，但父值被清空", survivor["parent_value_id"] is None, f"got {survivor}")
+    call("DELETE", f"/tags/values/{tmp_minor}", token=token)  # 收尾
 
     print(f"\n{'=' * 46}\n通过 {ok_count} 项，失败 {len(fail)} 项")
     if fail:

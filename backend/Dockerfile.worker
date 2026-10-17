@@ -1,0 +1,41 @@
+# Worker 镜像：与 API 同一份代码，但额外带上 rembg / ONNX Runtime（DECISIONS D5）。
+#
+#   docker build -f Dockerfile.worker -t wardrobe-worker:dev .
+#   docker compose up worker
+#
+# ONNX 模型（~/.u2net/*.onnx）**不打进镜像**：模型更新不该触发镜像重建。
+# 部署时把模型目录挂进来即可：
+#   volumes:
+#     - ./models:/root/.u2net        # 或设 WARDROBE_… 之外的 U2NET_HOME=/models
+# 离线环境先在有网的机器下载好 u2net.onnx / u2netp.onnx 再拷过去，
+# 详见 docs/开发说明.md「批次 3」章节。
+FROM python:3.12-slim
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Shanghai
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# onnxruntime 需要 libgomp；slim 基础镜像不带
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt requirements-worker.txt ./
+RUN pip install --index-url "${PIP_INDEX_URL}" -r requirements-worker.txt
+
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY app ./app
+
+# Worker 不监听端口；健康与否看进程存活，由 compose 的 restart 策略兜底
+CMD ["python", "-m", "app.worker"]

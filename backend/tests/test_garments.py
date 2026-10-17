@@ -15,6 +15,11 @@ def make_image_bytes(fmt: str = "PNG", size: tuple[int, int] = (800, 600)) -> by
     return buf.getvalue()
 
 
+def media_path(url: str | None) -> str:
+    """签名 URL 去掉 query 再比：`e` 是秒级时间戳，跨一秒就不相等（会偶发失败）。"""
+    return (url or "").split("?", 1)[0]
+
+
 async def _create(client: AsyncClient, headers, name: str = "米白针织开衫") -> dict:
     r = await client.post("/api/garments", json={"name": name}, headers=headers)
     assert r.status_code == 201, r.text
@@ -162,6 +167,58 @@ async def test_filter_by_tag_takes_intersection(client: AsyncClient, auth_header
     assert await names(jacket, knit) == []
 
 
+async def test_filter_by_tag_groups_union_of_intersections(client: AsyncClient, auth_headers) -> None:
+    """tag_groups：组内 AND、组间 OR。
+
+    对应前端分面筛选的语义：
+    「（上装 AND 开衫）OR（下装 AND 牛仔裤）」，维度之间靠笛卡尔积变 AND。
+    """
+    jacket = await _add_tag_value(client, auth_headers, "大类", "外套")
+    knit = await _add_tag_value(client, auth_headers, "大类", "针织")
+    wool = await _add_tag_value(client, auth_headers, "材质", "羊毛")
+    cotton = await _add_tag_value(client, auth_headers, "材质", "棉")
+
+    a = await _create(client, auth_headers, "羊毛外套")
+    b = await _create(client, auth_headers, "羊毛针织衫")
+    c = await _create(client, auth_headers, "棉质外套")
+    for garment, values in ((a, [jacket, wool]), (b, [knit, wool]), (c, [jacket, cotton])):
+        await client.patch(
+            f"/api/garments/{garment['id']}", json={"tag_value_ids": values}, headers=auth_headers
+        )
+
+    async def names(*groups: str) -> list[str]:
+        r = await client.get(
+            "/api/garments",
+            params=[("tag_groups", g) for g in groups],
+            headers=auth_headers,
+        )
+        assert r.status_code == 200, r.text
+        return sorted(i["name"] for i in r.json()["items"])
+
+    # 单组 = 组内 AND，与旧 tag_value_ids 一致
+    assert await names(f"{jacket},{wool}") == ["羊毛外套"]
+    # 组间 OR：外套的羊毛 或 针织的羊毛 —— 这正是「不同大类之间取或」
+    assert await names(f"{jacket},{wool}", f"{knit},{wool}") == ["羊毛外套", "羊毛针织衫"]
+    # 跨维度 AND 靠笛卡尔积：（外套 OR 针织）AND 棉 → 只有棉质外套
+    assert await names(f"{jacket},{cotton}", f"{knit},{cotton}") == ["棉质外套"]
+    # 两组都不命中
+    assert await names(f"{jacket},{cotton}", f"{knit},{wool}") == ["棉质外套", "羊毛针织衫"]
+
+
+async def test_tag_groups_rejects_malformed_input(client: AsyncClient, auth_headers) -> None:
+    bad = await client.get(
+        "/api/garments", params=[("tag_groups", "1,x")], headers=auth_headers
+    )
+    assert bad.status_code == 400
+
+    too_many = await client.get(
+        "/api/garments",
+        params=[("tag_groups", str(i)) for i in range(200)],
+        headers=auth_headers,
+    )
+    assert too_many.status_code == 400
+
+
 async def test_search_by_name(client: AsyncClient, auth_headers) -> None:
     await _create(client, auth_headers, "米白针织开衫")
     await _create(client, auth_headers, "黑色西装裤")
@@ -195,7 +252,7 @@ async def test_upload_creates_thumbnails(client: AsyncClient, auth_headers) -> N
     assert len(body["images"]) == 1
     image = body["images"][0]
     assert (image["width"], image["height"]) == (800, 600)
-    assert body["cover_url"] == image["thumb_medium_url"]
+    assert body["cover_url"] and media_path(body["cover_url"]) == media_path(image["thumb_medium_url"])
 
     small = await client.get(image["thumb_small_url"])
     assert small.status_code == 200
@@ -264,7 +321,7 @@ async def test_set_primary_image(client: AsyncClient, auth_headers) -> None:
     assert promoted.status_code == 200
     images = promoted.json()["images"]
     assert images[0]["id"] == second["id"]
-    assert promoted.json()["cover_url"] == images[0]["thumb_medium_url"]
+    assert media_path(promoted.json()["cover_url"]) == media_path(images[0]["thumb_medium_url"])
     assert first["id"] in [i["id"] for i in images]
 
 
@@ -359,3 +416,187 @@ async def test_tag_value_delete_untags_garments(client: AsyncClient, auth_header
 
     detail = await client.get(f"/api/garments/{garment['id']}", headers=auth_headers)
     assert detail.json()["tag_value_ids"] == []
+
+
+# ---------- 批次 3：AI 流水线状态机 ----------
+
+
+async def _set_status(session_factory, garment_id: int, status: str) -> None:
+    """直接改库，用来造 Worker 之外的中间态（processing 只能由 Worker 落）。"""
+    from sqlalchemy import select
+
+    from app.models.garment import Garment
+
+    async with session_factory() as s:
+        g = (await s.execute(select(Garment).where(Garment.id == garment_id))).scalar_one()
+        g.status = status
+        await s.commit()
+
+
+async def _write_suggestion(session_factory, garment_id: int, suggestion: dict) -> None:
+    """模拟 Worker 直连数据库回写候选结果（Worker 与 API 共享同一个库）。"""
+    import json
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from app.models.garment import Garment
+
+    async with session_factory() as s:
+        g = (await s.execute(select(Garment).where(Garment.id == garment_id))).scalar_one()
+        g.status = "needs_review"
+        g.ai_suggestion = json.dumps(suggestion, ensure_ascii=False)
+        g.processed_at = datetime.now(timezone.utc)
+        await s.commit()
+
+
+async def test_new_garment_is_ready_by_default(client: AsyncClient, auth_headers) -> None:
+    """不跑 AI 时衣物照常可用 —— 流水线是可选的，不该把新衣物卡住。"""
+    created = await _create(client, auth_headers)
+    assert created["status"] == "ready"
+    assert created["ai_suggestion"] is None
+
+
+async def test_enqueue_sets_pending_and_stays_idempotent(
+    client: AsyncClient, auth_headers
+) -> None:
+    garment = await _create(client, auth_headers)
+    url = f"/api/garments/{garment['id']}/process"
+
+    first = await client.post(url, headers=auth_headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "pending"
+
+    # 重复入队不该报错，也不该把状态改坏
+    again = await client.post(url, headers=auth_headers)
+    assert again.status_code == 200
+    assert again.json()["status"] == "pending"
+
+
+async def test_enqueue_rejects_while_processing(
+    client: AsyncClient, auth_headers, session_factory
+) -> None:
+    garment = await _create(client, auth_headers)
+    await _set_status(session_factory, garment["id"], "processing")
+
+    r = await client.post(f"/api/garments/{garment['id']}/process", headers=auth_headers)
+    assert r.status_code == 409
+
+
+async def test_list_filters_by_status(client: AsyncClient, auth_headers) -> None:
+    pending = await _create(client, auth_headers, name="待处理连衣裙")
+    await _create(client, auth_headers, name="已就绪外套")
+    await client.post(f"/api/garments/{pending['id']}/process", headers=auth_headers)
+
+    only_pending = await client.get(
+        "/api/garments", params={"status": "pending"}, headers=auth_headers
+    )
+    assert only_pending.json()["total"] == 1
+    assert only_pending.json()["items"][0]["name"] == "待处理连衣裙"
+
+    # 默认（不带 status）两类都要能看到，避免升级后衣橱「少东西」
+    all_items = await client.get("/api/garments", headers=auth_headers)
+    assert all_items.json()["total"] == 2
+
+
+async def test_list_rejects_unknown_status(client: AsyncClient, auth_headers) -> None:
+    r = await client.get("/api/garments", params={"status": "bogus"}, headers=auth_headers)
+    assert r.status_code == 400
+
+
+async def test_review_applies_suggestion(
+    client: AsyncClient, auth_headers, session_factory
+) -> None:
+    garment = await _create(client, auth_headers, name="未命名")
+    outer = await _add_tag_value(client, auth_headers, "大类", "外套")
+    await _write_suggestion(
+        session_factory,
+        garment["id"],
+        {
+            "name": "驼色长款风衣",
+            "tag_value_ids": [outer],
+            "provider": "rembg+clip",
+            "confidence": 0.82,
+        },
+    )
+
+    before = await client.get(f"/api/garments/{garment['id']}", headers=auth_headers)
+    assert before.json()["status"] == "needs_review"
+    suggestion = before.json()["ai_suggestion"]
+    assert suggestion["name"] == "驼色长款风衣"
+    assert suggestion["provider"] == "rembg+clip"
+    assert [(t["value"], t["category_name"]) for t in suggestion["tags"]] == [("外套", "大类")]
+
+    # 空 body = 全盘采纳
+    done = await client.post(f"/api/garments/{garment['id']}/review", json={}, headers=auth_headers)
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "ready"
+    assert done.json()["name"] == "驼色长款风衣"
+    assert done.json()["tag_value_ids"] == [outer]
+    assert done.json()["ai_suggestion"] is None  # 确认后建议清空
+
+
+async def test_review_can_override_suggestion(
+    client: AsyncClient, auth_headers, session_factory
+) -> None:
+    garment = await _create(client, auth_headers, name="未命名")
+    outer = await _add_tag_value(client, auth_headers, "大类", "外套")
+    coat = await _add_tag_value(client, auth_headers, "大类", "大衣")
+    await _write_suggestion(
+        session_factory,
+        garment["id"],
+        {"name": "猜错了", "tag_value_ids": [outer], "provider": "clip"},
+    )
+
+    done = await client.post(
+        f"/api/garments/{garment['id']}/review",
+        json={"name": "我自己的命名", "tag_value_ids": [coat]},
+        headers=auth_headers,
+    )
+    assert done.status_code == 200, done.text
+    assert done.json()["name"] == "我自己的命名"
+    assert done.json()["tag_value_ids"] == [coat]
+
+
+async def test_review_skips_tags_deleted_after_suggestion(
+    client: AsyncClient, auth_headers, session_factory
+) -> None:
+    """建议里的标签在复核前被删了 → 静默跳过，不该让这件衣物永远卡住。"""
+    garment = await _create(client, auth_headers, name="未命名")
+    keep = await _add_tag_value(client, auth_headers, "大类", "外套")
+    doomed = await _add_tag_value(client, auth_headers, "材质", "羊绒")
+    await _write_suggestion(
+        session_factory,
+        garment["id"],
+        {"name": "驼色大衣", "tag_value_ids": [keep, doomed], "provider": "clip"},
+    )
+    assert (await client.delete(f"/api/tags/values/{doomed}", headers=auth_headers)).status_code == 200
+
+    done = await client.post(f"/api/garments/{garment['id']}/review", json={}, headers=auth_headers)
+    assert done.status_code == 200, done.text
+    assert done.json()["tag_value_ids"] == [keep]
+    assert done.json()["status"] == "ready"
+
+
+async def test_broken_suggestion_json_is_ignored(
+    client: AsyncClient, auth_headers, session_factory
+) -> None:
+    """库里躺着一段坏 JSON 也不能让列表 / 详情 500。"""
+    import json
+    from sqlalchemy import select
+
+    from app.models.garment import Garment
+
+    garment = await _create(client, auth_headers)
+    async with session_factory() as s:
+        g = (await s.execute(select(Garment).where(Garment.id == garment["id"]))).scalar_one()
+        g.status = "needs_review"
+        g.ai_suggestion = "{not json"
+        await s.commit()
+
+    listed = await client.get("/api/garments", headers=auth_headers)
+    assert listed.status_code == 200
+    detail = await client.get(f"/api/garments/{garment['id']}", headers=auth_headers)
+    assert detail.status_code == 200
+    assert detail.json()["ai_suggestion"] is None
+    assert json.loads("{}") == {}

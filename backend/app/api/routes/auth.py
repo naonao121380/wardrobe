@@ -22,14 +22,23 @@ from app.core.security import (
 )
 from app.core.time import now_utc
 from app.models.user import User, UserSession
-from app.schemas.auth import (    LoginRequest,
+from app.schemas.auth import (
+    LlmSettingsIn,
+    LlmSettingsOut,
+    LoginRequest,
     PasswordChangeRequest,
+    ProfileUpdate,
+    QuotaOut,
     RefreshRequest,
     RegisterRequest,
+    RegistrationPolicyOut,
     SessionInfo,
     TokenResponse,
     UserOut,
 )
+from app.services import quota as quota_service
+from app.services import system as system_service
+from app.services.llm import apply_llm_settings, clear_llm_settings, llm_settings_out
 from app.services.tags import seed_default_categories
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -91,7 +100,7 @@ async def _issue_tokens(
     await db.commit()
     await db.refresh(us)
 
-    access, exp = create_access_token(user.id)
+    access, exp = create_access_token(user.id, us.id)
     return TokenResponse(
         access_token=access,
         refresh_token=raw_refresh,
@@ -114,11 +123,36 @@ async def login(payload: LoginRequest, request: Request, db: DbSession) -> Token
     return await _issue_tokens(db, user, request, payload.device_label)
 
 
+@router.get("/registration", response_model=RegistrationPolicyOut)
+async def registration_policy(db: DbSession) -> RegistrationPolicyOut:
+    """公开的注册策略。**不需要登录** —— 登录页要用它决定显不显示注册入口。"""
+    settings = await system_service.get_app_settings(db)
+    mode = settings.registration_mode
+    return RegistrationPolicyOut(mode=mode, invite_required=mode == "invite")
+
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest, request: Request, db: DbSession) -> TokenResponse:
-    s = get_settings()
-    if not s.allow_registration:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "当前未开放注册")
+    """自助注册。开不开、要不要邀请码，由库里的注册模式说了算。
+
+    三种模式（见 :mod:`app.services.system`）：
+
+    - ``open``   谁都能注册；
+    - ``invite`` 必须带一个可用邀请码，且**和建用户在同一笔事务里原子占用一次**；
+    - ``closed`` 直接拒绝，账号只能由管理员创建。
+    """
+    settings = await system_service.get_app_settings(db)
+    mode = settings.registration_mode
+    if mode == "closed":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "当前未开放注册，请联系管理员创建账号")
+
+    invite = None
+    if mode == "invite":
+        if not (payload.invite_code or "").strip():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "本次注册需要邀请码")
+        invite = await system_service.find_usable_code(db, payload.invite_code)
+        if invite is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "邀请码无效、已过期或用尽")
 
     dup = (
         await db.execute(select(User).where(User.username == payload.username))
@@ -131,6 +165,10 @@ async def register(payload: RegisterRequest, request: Request, db: DbSession) ->
         ).scalar_one_or_none()
         if dup_email is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "邮箱已被占用")
+
+    if invite is not None and not await system_service.consume_code(db, invite.id):
+        # 同一枚「一人一码」被两个人同时用：落败方到此为止，别建出第二个账号
+        raise HTTPException(status.HTTP_409_CONFLICT, "邀请码刚刚被用掉了，请换一个")
 
     user = User(
         username=payload.username,
@@ -206,6 +244,21 @@ async def me(user: CurrentUser) -> UserOut:
     return UserOut.model_validate(user)
 
 
+@router.patch("/me", response_model=UserOut)
+async def update_me(payload: ProfileUpdate, user: CurrentUser, db: DbSession) -> UserOut:
+    """改自己的资料。目前只开放显示名 —— 用户名是登录凭据，改了会让所有设备对不上。
+
+    传 ``null`` 表示清空（回落到用户名显示）；只传想改的字段，别的保持不动。
+    """
+    fields = payload.model_dump(exclude_unset=True)
+    if "display_name" in fields:
+        name = (fields["display_name"] or "").strip()
+        user.display_name = name or None
+    await db.commit()
+    await db.refresh(user)
+    return UserOut.model_validate(user)
+
+
 @router.get("/sessions", response_model=list[SessionInfo])
 async def list_sessions(user: CurrentUser, db: DbSession) -> list[SessionInfo]:
     rows = (
@@ -247,3 +300,51 @@ async def change_password(
     )
     await db.commit()
     return {"revoked": res.rowcount or 0}
+
+
+# ---------- 自己的大模型配置 ----------
+
+
+@router.get("/llm", response_model=LlmSettingsOut)
+async def read_my_llm(user: CurrentUser) -> LlmSettingsOut:
+    """我的模型配置（API Key 只回脱敏串）。"""
+    return llm_settings_out(user)
+
+
+@router.put("/llm", response_model=LlmSettingsOut)
+async def update_my_llm(
+    payload: LlmSettingsIn, user: CurrentUser, db: DbSession
+) -> LlmSettingsOut:
+    """自己填模型地址 / API Key / 模型名称。
+
+    ``api_key`` 不传 = 保持不变（只改模型名时不用重新粘密钥）；传空串 = 清空。
+    自己填过之后 ``llm_from_admin`` 归零 —— 这份配置算用户自己的了。
+    """
+    apply_llm_settings(
+        user,
+        base_url=payload.base_url,
+        model=payload.model,
+        api_key=payload.api_key,
+        from_admin=False,
+    )
+    await db.commit()
+    await db.refresh(user)
+    return llm_settings_out(user)
+
+
+@router.delete("/llm", response_model=LlmSettingsOut)
+async def clear_my_llm(user: CurrentUser, db: DbSession) -> LlmSettingsOut:
+    clear_llm_settings(user)
+    await db.commit()
+    await db.refresh(user)
+    return llm_settings_out(user)
+
+
+# ---------- 自己的配额用量 ----------
+
+
+@router.get("/quota", response_model=QuotaOut)
+async def read_my_quota(user: CurrentUser, db: DbSession) -> QuotaOut:
+    """我的用量与上限。设置页给自己看，心里有数。"""
+    used = await quota_service.usage(db, user.id)
+    return QuotaOut(**quota_service.quota_summary(user, used))

@@ -15,6 +15,7 @@ import {
   setAuthLostHandler,
   setTokens,
   tryRefresh,
+  type RegisterPayload,
   type User,
 } from "../api/client";
 
@@ -22,6 +23,7 @@ type AuthState = {
   user: User | null;
   ready: boolean;
   login: (username: string, password: string) => Promise<void>;
+  register: (payload: RegisterPayload) => Promise<void>;
   logout: () => Promise<void>;
   logoutAll: () => Promise<void>;
   refreshUser: () => Promise<void>;
@@ -64,6 +66,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(data.user);
   }, []);
 
+  /** 注册成功后直接进入登录态 —— 服务端注册接口本来就返回一对令牌。 */
+  const register = useCallback(async (payload: RegisterPayload) => {
+    const data = await api.register(payload);
+    setTokens(data);
+    setUser(data.user);
+  }, []);
+
   const logout = useCallback(async () => {
     const rt = getRefreshToken();
     if (rt) {
@@ -92,8 +101,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<AuthState>(
-    () => ({ user, ready, login, logout, logoutAll, refreshUser }),
-    [user, ready, login, logout, logoutAll, refreshUser],
+    () => ({ user, ready, login, register, logout, logoutAll, refreshUser }),
+    [user, ready, login, register, logout, logoutAll, refreshUser],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

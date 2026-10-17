@@ -4,7 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#b0553a" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/favicon.svg" />
     <title>衣橱</title>
+    <script>
+      // 主题引导：必须在样式计算 / 首帧之前把 data-theme 写上，否则会先闪一下浅色。
+      // 三档选择存在 localStorage 里（light / dark / system），只有 system 才去读系统偏好。
+      // 这段和 src/lib/theme.ts 是配套的 —— 那边改 key 这边也要改。
+      (function () {
+        try {
+          var choice = localStorage.getItem("wardrobe.theme") || "system";
+          var dark =
+            choice === "dark" ||
+            (choice !== "light" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+        } catch (e) {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

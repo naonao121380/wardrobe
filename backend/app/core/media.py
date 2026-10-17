@@ -83,10 +83,15 @@ def _make_thumb(img: Image.Image, max_px: int) -> bytes:
     return buf.getvalue()
 
 
-def store_image(owner_id: int, data: bytes, content_type: str | None) -> dict[str, object]:
-    """落盘原图 + 两档缩略图，返回可直接写进 GarmentImage 的字段。
+def store_image(
+    owner_id: int, data: bytes, content_type: str | None, folder: str = "garments"
+) -> dict[str, object]:
+    """落盘原图 + 两档缩略图，返回可直接写进 GarmentImage / OutfitImage 的字段。
 
     原图**不做重编码**（保留原始格式与画质），仅在生成缩略图时应用 EXIF 方向。
+
+    ``folder`` 决定落在哪个子目录：衣物用 ``garments``（默认），搭配成图用 ``outfits``
+    —— 混在一个目录里的话，按目录做备份 / 清理时没法区分。
     """
     s = get_settings()
     ct = (content_type or "").split(";")[0].strip().lower()
@@ -104,7 +109,7 @@ def store_image(owner_id: int, data: bytes, content_type: str | None) -> dict[st
         raise MediaError("无法解析该图片文件") from exc
 
     uid = uuid.uuid4().hex
-    rel_dir = f"garments/{owner_id}"
+    rel_dir = f"{folder}/{owner_id}"
     resolve_key(f"{rel_dir}/thumbs").mkdir(parents=True, exist_ok=True)
 
     original_key = f"{rel_dir}/{uid}{ext}"
@@ -126,6 +131,17 @@ def store_image(owner_id: int, data: bytes, content_type: str | None) -> dict[st
     }
 
 
+#: 删磁盘文件时「无论如何都该吞掉」的异常类型。
+#:
+#: 除了常规 ``Exception``，这里**显式带上 ``SystemExit``**：文件安全钩子
+#: （沙箱把删除重定向到回收站、批量删除守卫等）拦下删除时是直接
+#: ``raise SystemExit(1)`` 的 —— 它是 ``BaseException`` 的旁支，
+#: ``except Exception`` 接不住，于是「一个缓存文件没删掉」这种小事会把整个
+#: 请求变成 500，而数据库那边早就提交了（同一个坑踩过两次，见 KNOWN_TRAPS）。
+#: 只放过 ``SystemExit``：``KeyboardInterrupt`` 之类仍然照常上抛。
+DELETION_SWALLOWED = (Exception, SystemExit)
+
+
 def delete_keys(keys: list[str | None]) -> None:
     """尽力删除磁盘文件；**任何**失败都只记日志，绝不往上抛。
 
@@ -138,8 +154,8 @@ def delete_keys(keys: list[str | None]) -> None:
             continue
         try:
             resolve_key(key).unlink(missing_ok=True)
-        except Exception as exc:  # noqa: BLE001 - 见上：这里就是要吞掉一切
-            log.warning("删除媒体文件失败，已跳过：%s（%s）", key, exc)
+        except DELETION_SWALLOWED as exc:  # noqa: BLE001 - 见上：这里就是要吞掉一切
+            log.warning("删除媒体文件失败，已跳过：%s（%r）", key, exc)
 
 
 def open_for_export(rel_key: str) -> tuple[bytes, str]:

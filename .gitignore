@@ -35,3 +35,19 @@ dev.db*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---- 本地快照（回退用，不入库）----
+snapshots/
+
+# ---- 内部资料（不上公开仓库）----
+# handoff/ 是给协作者看的交接笔记，含内网地址、部署机 SSH 口令与 Gitea 凭据；
+# backend/.verify/ 是本机验收用的脚本、日志与截图。
+# 这两块只留在本地，不随源码发布。
+handoff/
+backend/.verify/
+
+# ---- 测试与日志产物 ----
+*.log
+.pytest-junit.xml
+.pytest-run.log
+

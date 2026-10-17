@@ -1,3 +1,13 @@
+# wardrobe —— 源码版 compose（带 build:）
+#
+# ★ 存储：不用命名卷，全部绑定挂载到本文件同目录：
+#     ./data/postgres   PostgreSQL 数据（entrypoint 会自动 chown 成 uid 70，别手工改）
+#     ./data/redis      Redis AOF（自动 chown 成 uid 999）
+#     ./data/media      原图 / 抠图 / 缩略图（api 与 worker 共用，落盘属主是 root）
+#     ./models          ONNX 抠图模型
+#   ⚠️ ./data/postgres 必须在**本地盘**上，别放 SMB / NFS。
+#   发行版（纯镜像）compose 见 out/release-1.0.0/docker-compose.yml。
+
 name: wardrobe
 
 services:
@@ -10,7 +20,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-wardrobe}
       TZ: Asia/Shanghai
     volumes:
-      - db-data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wardrobe} -d ${POSTGRES_DB:-wardrobe}"]
       interval: 10s
@@ -24,7 +34,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - redis-data:/data
+      - ./data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -43,9 +53,11 @@ services:
     environment:
       WARDROBE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wardrobe}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-wardrobe}
       WARDROBE_REDIS_URL: redis://redis:6379/0
+      # 框选重抠：API 镜像里没有 rembg（模型只在 Worker），把它转给 worker 算
+      WARDROBE_WORKER_REFINE_URL: http://worker:${WARDROBE_WORKER_REFINE_PORT:-8001}
       TZ: Asia/Shanghai
     volumes:
-      - media-data:/data/media
+      - ./data/media:/data/media
     depends_on:
       db:
         condition: service_healthy
@@ -67,10 +79,44 @@ services:
         condition: service_started
     networks: [wardrobe]
 
-volumes:
-  db-data:
-  redis-data:
-  media-data:
+  # AI 流水线 Worker（DECISIONS D5）：抠图模型只装在这里，API 镜像保持轻。
+  # 不想要 AI 时 `docker compose up -d --scale worker=0` 或删掉这一段，
+  # 衣橱照常可用（DECISIONS D7）。
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: wardrobe-worker:${WARDROBE_TAG:-dev}
+    restart: unless-stopped
+    # 硬内存上限：抠图是全场最吃内存的一步（onnxruntime + 大图中间数组）。
+    # 没有上限时，一张超大图能把整台 NAS 拖到卡死、只能断电重启（2026-10-17 真实事故）。
+    # 有了它，最坏是被 OOM 杀掉后自动重启，任务 30 分钟后回收重试 —— 影响一件衣服，
+    # 不影响整机。1600px 输入上限下实测峰值 < 600 MB。
+    # ★ 数值在 .env 的 WARDROBE_WORKER_MEM_LIMIT 里改，别改这里。
+    mem_limit: ${WARDROBE_WORKER_MEM_LIMIT:-1500m}
+    env_file: [.env]
+    environment:
+      WARDROBE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wardrobe}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-wardrobe}
+      WARDROBE_AI_MATTING_PROVIDER: ${WARDROBE_AI_MATTING_PROVIDER:-rembg}
+      WARDROBE_AI_TAGGER_PROVIDER: ${WARDROBE_AI_TAGGER_PROVIDER:-none}
+      # 框选重抠的内部接口（api 会连它）。只监听容器网络，这里**故意不 publish**：
+      # 接口没有鉴权，放出去等于把一条耗 CPU 的路径交给整个局域网。
+      WARDROBE_WORKER_REFINE_PORT: ${WARDROBE_WORKER_REFINE_PORT:-8001}
+      # numba 编译缓存：pymatting 的 @njit(cache=True) 写不进只读镜像层，
+      # 不指到可写目录就**每次启动重新编译**（1 vCPU 上要好几分钟）。
+      NUMBA_CACHE_DIR: /data/numba
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/media:/data/media
+      - ./data/numba:/data/numba
+      # 模型放宿主机 ./models（u2net.onnx ~176MB / u2netp.onnx ~4.7MB），不打进镜像
+      - ./models:/root/.u2net
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [wardrobe]
 
 networks:
   wardrobe:

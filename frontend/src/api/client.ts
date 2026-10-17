@@ -14,6 +14,7 @@ export type User = {
   display_name: string | null;
   email: string | null;
   is_admin: boolean;
+  is_active: boolean;
 };
 
 export type TokenResponse = {
@@ -35,6 +36,44 @@ export type SessionInfo = {
   expires_at: string;
 };
 
+/** 注册模式。open = 自助；invite = 要邀请码；closed = 关闭。 */
+export type RegistrationMode = "open" | "invite" | "closed";
+
+/** 服务端运行信息，「关于」面板用。 */
+export type Meta = {
+  app_name: string;
+  version: string;
+  registration_mode: RegistrationMode;
+  /** none / rembg */
+  matting_provider: string;
+  /** none / clip / vlm */
+  tagger_provider: string;
+  tagger_available: boolean;
+  /** 当前用户有没有配好自己的大模型 */
+  llm_configured: boolean;
+};
+
+/** 我自己的大模型配置（API Key 只回脱敏串）。 */
+export type LlmSettings = {
+  base_url: string | null;
+  model: string | null;
+  api_key_masked: string;
+  /** 这份配置是不是管理员代设的 */
+  from_admin: boolean;
+  configured: boolean;
+};
+
+export type QuotaItem = { used: number; limit: number | null };
+export type Quota = { garments: QuotaItem; outfits: QuotaItem; tags: QuotaItem };
+
+export type RegisterPayload = {
+  username: string;
+  password: string;
+  display_name?: string | null;
+  email?: string | null;
+  invite_code?: string | null;
+};
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -44,6 +83,68 @@ export class ApiError extends Error {
     this.status = status;
   }
 }
+
+// ---------- 管理端类型 ----------
+
+export type UserStats = {
+  garments: number;
+  outfits: number;
+  tags: number;
+  sessions: number;
+};
+
+export type AdminUser = {
+  id: number;
+  username: string;
+  display_name: string | null;
+  email: string | null;
+  is_admin: boolean;
+  is_active: boolean;
+  created_at: string;
+  last_seen_at: string | null;
+  stats: UserStats;
+  quotas: Quota;
+  llm: LlmSettings;
+};
+
+export type AdminUserDetail = AdminUser & { sessions: SessionInfo[] };
+
+/** 建号 / 改号时提交的字段。改号只传想改的。 */
+export type AdminUserPayload = {
+  username?: string;
+  password?: string;
+  display_name?: string | null;
+  email?: string | null;
+  is_admin?: boolean;
+  is_active?: boolean;
+  garment_quota?: number | null;
+  outfit_quota?: number | null;
+  tag_quota?: number | null;
+  clear_garment_quota?: boolean;
+  clear_outfit_quota?: boolean;
+  clear_tag_quota?: boolean;
+  llm_base_url?: string | null;
+  llm_api_key?: string | null;
+  llm_model?: string | null;
+};
+
+export type RegistrationSettings = {
+  mode: RegistrationMode;
+  invite_codes_usable: number;
+};
+
+export type InviteCode = {
+  id: number;
+  code: string;
+  note: string | null;
+  max_uses: number | null;
+  used_count: number;
+  remaining: number | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  usable: boolean;
+};
 
 const REFRESH_KEY = "wardrobe.refresh_token";
 const SESSION_KEY = "wardrobe.session_id";
@@ -108,7 +209,13 @@ async function raw<T>(path: string, init: RequestInit, withAuth: boolean): Promi
     } catch {
       /* 非 JSON 响应，用默认文案 */
     }
-    throw new ApiError(res.status, extractDetail(payload, `请求失败（${res.status}）`));
+    // 413 往往是网关（nginx）直接回的，body 可能是它自己的 HTML 错误页，
+    // 解析不出 detail。给一句人话，别让用户对着「请求失败（413）」猜。
+    const fallback =
+      res.status === 413
+        ? "上传的内容太大，被网关挡下了：请减少单次上传的张数（或换小一点的图）再试。"
+        : `请求失败（${res.status}）`;
+    throw new ApiError(res.status, extractDetail(payload, fallback));
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -187,10 +294,26 @@ export function tryRefresh(): Promise<boolean> {
 }
 
 export const api = {
+  /** 公开的注册策略（不需要登录）—— 登录页决定要不要显示注册入口。 */
+  registrationPolicy: () =>
+    raw<{ mode: RegistrationMode; invite_required: boolean }>(
+      "/auth/registration",
+      { method: "GET" },
+      false,
+    ),
+
   login: (username: string, password: string, deviceLabel?: string) =>
     raw<TokenResponse>(
       "/auth/login",
       { method: "POST", body: JSON.stringify({ username, password, device_label: deviceLabel ?? null }) },
+      false,
+    ),
+
+  /** 自助注册。要不要邀请码由服务端的注册模式决定，前端只管把码带上。 */
+  register: (payload: RegisterPayload) =>
+    raw<TokenResponse>(
+      "/auth/register",
+      { method: "POST", body: JSON.stringify({ ...payload, device_label: null }) },
       false,
     ),
 
@@ -203,6 +326,24 @@ export const api = {
 
   me: () => request<User>("/auth/me"),
 
+  /** 改自己的资料。目前只有显示名；传 null / 空串表示清空（显示时回落到用户名）。 */
+  updateProfile: (payload: { display_name?: string | null }) =>
+    request<User>("/auth/me", { method: "PATCH", body: JSON.stringify(payload) }),
+
+  /** 版本号、AI 能力是否就绪 —— 「关于」面板用。 */
+  meta: () => request<Meta>("/meta"),
+
+  // ---------- 自己的大模型配置 ----------
+  myLlm: () => request<LlmSettings>("/auth/llm"),
+
+  /** apiKey 不传 = 保持不变；传空串 = 清空。 */
+  saveMyLlm: (payload: { base_url: string | null; model: string | null; api_key?: string }) =>
+    request<LlmSettings>("/auth/llm", { method: "PUT", body: JSON.stringify(payload) }),
+
+  clearMyLlm: () => request<LlmSettings>("/auth/llm", { method: "DELETE" }),
+
+  myQuota: () => request<Quota>("/auth/quota"),
+
   logoutAll: () => request<{ revoked: number }>("/auth/logout-all", { method: "POST" }),
 
   sessions: () => request<SessionInfo[]>("/auth/sessions"),
@@ -214,4 +355,67 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
     }),
+};
+
+/** 管理端接口。全部要求管理员身份，非管理员会拿到 403。 */
+export const adminApi = {
+  users: () => request<AdminUser[]>("/admin/users"),
+
+  user: (id: number) => request<AdminUserDetail>(`/admin/users/${id}`),
+
+  createUser: (payload: AdminUserPayload) =>
+    request<AdminUserDetail>("/admin/users", { method: "POST", body: JSON.stringify(payload) }),
+
+  updateUser: (id: number, payload: AdminUserPayload) =>
+    request<AdminUserDetail>(`/admin/users/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteUser: (id: number) =>
+    request<{ ok: boolean; username: string; deleted_files: number }>(`/admin/users/${id}`, {
+      method: "DELETE",
+    }),
+
+  resetPassword: (id: number, newPassword: string) =>
+    request<{ revoked: number }>(`/admin/users/${id}/password`, {
+      method: "POST",
+      body: JSON.stringify({ new_password: newPassword }),
+    }),
+
+  forceLogout: (id: number) =>
+    request<{ revoked: number }>(`/admin/users/${id}/logout`, { method: "POST" }),
+
+  setUserLlm: (id: number, payload: { base_url: string | null; model: string | null; api_key?: string }) =>
+    request<AdminUserDetail>(`/admin/users/${id}/llm`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+
+  clearUserLlm: (id: number) =>
+    request<AdminUserDetail>(`/admin/users/${id}/llm`, { method: "DELETE" }),
+
+  settings: () => request<RegistrationSettings>("/admin/settings"),
+
+  updateSettings: (mode: RegistrationMode) =>
+    request<RegistrationSettings>("/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify({ mode }),
+    }),
+
+  inviteCodes: () => request<InviteCode[]>("/admin/invite-codes"),
+
+  createInviteCodes: (payload: {
+    count?: number;
+    note?: string | null;
+    max_uses?: number | null;
+    expires_in_days?: number | null;
+  }) =>
+    request<InviteCode[]>("/admin/invite-codes", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  revokeInviteCode: (id: number) =>
+    request<InviteCode>(`/admin/invite-codes/${id}`, { method: "DELETE" }),
 };

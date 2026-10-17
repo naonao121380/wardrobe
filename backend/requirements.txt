@@ -11,3 +11,11 @@ argon2-cffi>=23.1
 python-multipart>=0.0.12
 email-validator>=2.2
 pillow>=11.0
+
+# 出站 HTTP 客户端。两个地方要用，**两个都在 API 进程里**：
+#   1) VLM 打标（app/worker/providers.py:VlmTagger）——「搭配 AI 推荐」直接调它；
+#   2) 框选重抠代理到 Worker（app/services/refine.py）。
+# ⚠️ 历史坑：这一行原来只写在 requirements-worker.txt 里 —— Worker 打得标，
+#    API 一调就报 `httpx 未安装`（2026-10-17 线上实测）。API 与 Worker 共用本文件，
+#    以后别再把它单独挪回去。
+httpx>=0.27
